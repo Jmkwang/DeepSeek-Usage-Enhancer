@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek Daily Monitor
 // @namespace    https://github.com/local/deepseek-usage-monitor
-// @version      1.4.2
+// @version      1.4.3
 // @description  拦截 DeepSeek 开放平台用量 API（兼容新版 by_api_key 接口），在小窗口中展示完整数据（纯本地，无远程通信）
 // @author       Jmkwang
 // @license      MIT
@@ -235,25 +235,59 @@
   }
 
   function transformUserSummary(bizData) {
-    const normalBal = (bizData.normal_wallets && bizData.normal_wallets[0])
-      ? Number(bizData.normal_wallets[0].balance) || 0 : 0;
-    const bonusBal = (bizData.bonus_wallets && bizData.bonus_wallets[0])
-      ? Number(bizData.bonus_wallets[0].balance) || 0 : 0;
+    // 金额可能为字符串数字、数字或 {amount} 对象, 统一读取
+    const readAmount = (v) => {
+      if (v === undefined || v === null) return 0;
+      if (typeof v === 'object') return Number(v.amount) || Number(v.balance) || 0;
+      return Number(v) || 0;
+    };
 
-    // 新版可能直接给 total_balance / topped_up_balance / granted_balance
+    // 余额: 汇总所有 normal/bonus 钱包 (新版接口实测: normal_wallets[] / bonus_wallets[])
+    let normalBal = 0, bonusBal = 0;
+    if (Array.isArray(bizData.normal_wallets)) {
+      for (const w of bizData.normal_wallets) normalBal += readAmount(w.balance);
+    } else if (bizData.normal_balance !== undefined) {
+      normalBal = readAmount(bizData.normal_balance);
+    }
+    if (Array.isArray(bizData.bonus_wallets)) {
+      for (const w of bizData.bonus_wallets) bonusBal += readAmount(w.balance);
+    } else if (bizData.bonus_balance !== undefined) {
+      bonusBal = readAmount(bizData.bonus_balance);
+    }
+
+    // 兜底: 直接给 total_balance / topped_up_balance / granted_balance
     let total = normalBal + bonusBal;
     if (total === 0) {
-      const tb = Number(bizData.total_balance) || 0;
-      const tu = Number(bizData.topped_up_balance) || 0;
-      const gr = Number(bizData.granted_balance) || 0;
+      const tb = readAmount(bizData.total_balance);
+      const tu = readAmount(bizData.topped_up_balance);
+      const gr = readAmount(bizData.granted_balance);
       if (tb > 0) total = tb;
       else if (tu + gr > 0) total = tu + gr;
     }
 
-    const monthlyCost = (bizData.monthly_costs && bizData.monthly_costs[0])
-      ? Number(bizData.monthly_costs[0].amount) || 0 : 0;
-    const currency = (bizData.monthly_costs && bizData.monthly_costs[0])
-      ? bizData.monthly_costs[0].currency : (bizData.currency || 'CNY');
+    // 本月消费: 新版 monthly_usage (数字或 {amount,currency}) / total_costs[] / 旧版 monthly_costs[]
+    let monthlyCost = 0;
+    let currency = bizData.currency || 'CNY';
+    const mu = bizData.monthly_usage;
+    if (mu !== undefined && mu !== null) {
+      if (typeof mu === 'object') {
+        monthlyCost = readAmount(mu.amount);
+        if (mu.currency) currency = mu.currency;
+      } else {
+        monthlyCost = Number(mu) || 0;
+      }
+    }
+    if (monthlyCost === 0 && Array.isArray(bizData.total_costs) && bizData.total_costs[0]) {
+      monthlyCost = readAmount(bizData.total_costs[0].amount);
+      if (bizData.total_costs[0].currency) currency = bizData.total_costs[0].currency;
+    }
+    if (monthlyCost === 0 && Array.isArray(bizData.monthly_costs) && bizData.monthly_costs[0]) {
+      monthlyCost = readAmount(bizData.monthly_costs[0].amount);
+      if (bizData.monthly_costs[0].currency) currency = bizData.monthly_costs[0].currency;
+    }
+    if (monthlyCost === 0 && bizData.monthly_cost !== undefined) {
+      monthlyCost = readAmount(bizData.monthly_cost);
+    }
 
     return {
       balance: {
