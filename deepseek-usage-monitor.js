@@ -1,13 +1,26 @@
 // ==UserScript==
 // @name         DeepSeek Daily Monitor
-// @namespace    https://github.com/local/deepseek-usage-monitor
-// @version      1.2.2
-// @description  拦截 DeepSeek 开放平台用量 API，在小窗口中展示完整数据（纯本地，无远程通信）
-// @author       Jmkwang
+// @namespace    https://github.com/vlify/DeepSeek-Usage-Enhancer
+// @version      1.4.4
+// @description  拦截 DeepSeek 开放平台用量 API（兼容新版 by_api_key 接口），在小窗口中展示完整数据（纯本地，无远程通信）
+// @author       Jmkwang; vlify
+// @license      MIT
+// @homepageURL  https://github.com/vlify/DeepSeek-Usage-Enhancer
+// @supportURL   https://github.com/vlify/DeepSeek-Usage-Enhancer/issues
 // @match        https://platform.deepseek.com/usage*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
+
+// ============================================================
+// 本脚本为 Jmkwang/DeepSeek-Usage-Enhancer 的修改版 (fork)
+// 原项目: https://github.com/Jmkwang/DeepSeek-Usage-Enhancer (MIT)
+// 修改者: vlify
+// 修改内容: ① 元数据规范化, 为 GreasyFork 托管做准备
+//           ② 适配新版平台 (2026-07 改版): 拦截 /usage/by_api_key/amount|cost
+//              新接口 (series[].buckets[], 金额为字符串), 同时兼容旧版结构
+// 许可证: MIT, 完整文本见仓库 LICENSE 文件
+// ============================================================
 
 (function () {
   'use strict';
@@ -114,20 +127,188 @@
     return { requests, tokens: { total, cached_input: cachedInput, uncached_input: uncachedInput, output }, cache_hit_rate: cacheHitRate };
   }
 
-  function transformUserSummary(bizData) {
-    const normalBal = (bizData.normal_wallets && bizData.normal_wallets[0])
-      ? Number(bizData.normal_wallets[0].balance) || 0 : 0;
-    const bonusBal = (bizData.bonus_wallets && bizData.bonus_wallets[0])
-      ? Number(bizData.bonus_wallets[0].balance) || 0 : 0;
+  // ---- 新版平台: 桶的 time 是 Unix 秒, 按本地时区归入"今日" ----
+  function localDateOf(unixSec) {
+    const d = new Date(unixSec * 1000);
+    return d.getFullYear() + '-' +
+      String(d.getMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getDate()).padStart(2, '0');
+  }
 
-    const monthlyCost = (bizData.monthly_costs && bizData.monthly_costs[0])
-      ? Number(bizData.monthly_costs[0].amount) || 0 : 0;
-    const currency = (bizData.monthly_costs && bizData.monthly_costs[0])
-      ? bizData.monthly_costs[0].currency : 'CNY';
+  function localToday() {
+    return localDateOf(Math.floor(Date.now() / 1000));
+  }
+
+  // usage 字段可能是旧版数组 [{type, amount}] 或新版对象 {request, response_token, ...}
+  function extractMetricsFromUsageFlexible(usage) {
+    if (Array.isArray(usage)) {
+      return extractMetricsFromUsage(usageArrayToMap(usage));
+    }
+    if (usage && typeof usage === 'object') {
+      const n = (v) => Number(v) || 0;
+      const pick = (...keys) => {
+        for (const k of keys) {
+          if (usage[k] !== undefined) return n(usage[k]);
+        }
+        return 0;
+      };
+      // 真实字段名 (2026-07 新版接口实测):
+      // usage = { REQUEST, RESPONSE_TOKEN, PROMPT_CACHE_HIT_TOKEN, PROMPT_CACHE_MISS_TOKEN } (全大写蛇形)
+      // 同时兜底 camelCase / snake_case 变体
+      const cachedInput = pick('PROMPT_CACHE_HIT_TOKEN', 'promptCacheHitToken', 'prompt_cache_hit_token', 'cached_input_tokens', 'cache_hit_tokens');
+      const uncachedInput = pick('PROMPT_CACHE_MISS_TOKEN', 'promptCacheMissToken', 'prompt_cache_miss_token', 'uncached_input_tokens', 'cache_miss_tokens');
+      const output = pick('RESPONSE_TOKEN', 'responseToken', 'response_token', 'output_tokens', 'completion_tokens');
+      const requests = pick('REQUEST', 'request', 'apiRequests', 'api_requests', 'requests');
+      const total = cachedInput + uncachedInput + output;
+      const divisor = cachedInput + uncachedInput;
+      const cacheHitRate = divisor > 0
+        ? Math.round((cachedInput / divisor) * 10000) / 100
+        : null;
+      return { requests, tokens: { total, cached_input: cachedInput, uncached_input: uncachedInput, output }, cache_hit_rate: cacheHitRate };
+    }
+    return { requests: 0, tokens: { total: 0, cached_input: 0, uncached_input: 0, output: 0 }, cache_hit_rate: null };
+  }
+
+  // 收集 (model, date/time, usage) 记录, 兼容新旧两种结构
+  function collectUsageRecords(bizData) {
+    const records = [];
+    // 新版: series[].buckets[].usage (按模型/API Key 拆分)
+    if (Array.isArray(bizData.series)) {
+      for (const s of bizData.series) {
+        if (!s || !s.model || !Array.isArray(s.buckets)) continue;
+        for (const b of s.buckets) {
+          if (b && b.usage) records.push({ model: s.model, time: b.time, usage: b.usage });
+        }
+      }
+      return records;
+    }
+    // 旧版: days[].data[] + total[]
+    if (Array.isArray(bizData.days)) {
+      for (const day of bizData.days) {
+        if (!day || !Array.isArray(day.data)) continue;
+        for (const entry of day.data) {
+          if (entry && entry.model) records.push({ model: entry.model, date: day.date, usage: entry.usage });
+        }
+      }
+    }
+    for (const entry of (bizData.total || [])) {
+      if (entry && entry.model) records.push({ model: entry.model, usage: entry.usage });
+    }
+    return records;
+  }
+
+  // 收集 (model, date/time, cost) 记录
+  function collectCostRecords(bizData) {
+    const records = [];
+    // 新版: data[].series[].buckets[].cost (按币种分组, 金额是字符串)
+    if (Array.isArray(bizData.data)) {
+      for (const group of bizData.data) {
+        if (!group || !Array.isArray(group.series)) continue;
+        for (const s of group.series) {
+          if (!s || !s.model || !Array.isArray(s.buckets)) continue;
+          for (const b of s.buckets) {
+            if (b) records.push({ model: s.model, time: b.time, cost: Number(b.cost) || 0 });
+          }
+        }
+      }
+      return records;
+    }
+    // 旧版: days[].data[] 的 usage 金额
+    if (Array.isArray(bizData.days)) {
+      for (const day of bizData.days) {
+        if (!day || !Array.isArray(day.data)) continue;
+        for (const entry of day.data) {
+          if (!entry) continue;
+          let c = 0;
+          if (Array.isArray(entry.usage)) {
+            for (const u of entry.usage) c += Number(u.amount) || 0;
+          }
+          records.push({ model: entry.model || '', date: day.date, cost: c });
+        }
+      }
+    }
+    return records;
+  }
+
+  // 记录是否属于"今日": 旧版日期(UTC)或新版 Unix 秒(本地时区)
+  function isTodayRecord(rec) {
+    if (rec.date !== undefined) {
+      return rec.date === utcToday() || rec.date === localToday();
+    }
+    if (rec.time !== undefined) {
+      return localDateOf(rec.time) === localToday();
+    }
+    return true;
+  }
+
+  function transformUserSummary(bizData) {
+    // 金额可能为字符串数字、数字或 {amount} 对象, 统一读取
+    const readAmount = (v) => {
+      if (v === undefined || v === null) return 0;
+      if (typeof v === 'object') return Number(v.amount) || Number(v.balance) || 0;
+      return Number(v) || 0;
+    };
+
+    // 余额: 汇总所有 normal/bonus 钱包 (新版接口实测: normal_wallets[] / bonus_wallets[])
+    let normalBal = 0, bonusBal = 0;
+    if (Array.isArray(bizData.normal_wallets)) {
+      for (const w of bizData.normal_wallets) normalBal += readAmount(w.balance);
+    } else if (bizData.normal_balance !== undefined) {
+      normalBal = readAmount(bizData.normal_balance);
+    }
+    if (Array.isArray(bizData.bonus_wallets)) {
+      for (const w of bizData.bonus_wallets) bonusBal += readAmount(w.balance);
+    } else if (bizData.bonus_balance !== undefined) {
+      bonusBal = readAmount(bizData.bonus_balance);
+    }
+
+    // 兜底: 直接给 total_balance / topped_up_balance / granted_balance
+    let total = normalBal + bonusBal;
+    if (total === 0) {
+      const tb = readAmount(bizData.total_balance);
+      const tu = readAmount(bizData.topped_up_balance);
+      const gr = readAmount(bizData.granted_balance);
+      if (tb > 0) total = tb;
+      else if (tu + gr > 0) total = tu + gr;
+    }
+
+    // 币种: 钱包币种优先 (真实货币), 其次 bizData.currency, 默认 CNY
+    let currency = 'CNY';
+    if (Array.isArray(bizData.normal_wallets) && bizData.normal_wallets[0] && bizData.normal_wallets[0].currency) {
+      currency = bizData.normal_wallets[0].currency;
+    } else if (Array.isArray(bizData.bonus_wallets) && bizData.bonus_wallets[0] && bizData.bonus_wallets[0].currency) {
+      currency = bizData.bonus_wallets[0].currency;
+    } else if (bizData.currency) {
+      currency = bizData.currency;
+    }
+
+    // 本月消费: 新版 monthly_usage (数字或 {amount,currency}) / total_costs[] / 旧版 monthly_costs[]
+    // 注意: monthly_usage 可能是 Token 用量对象 (带 currency 但无金额), 只在取到金额时才采用其币种
+    let monthlyCost = 0;
+    const mu = bizData.monthly_usage;
+    if (mu !== undefined && mu !== null) {
+      if (typeof mu === 'object') {
+        monthlyCost = readAmount(mu.amount);
+        if (monthlyCost > 0 && mu.currency) currency = mu.currency;
+      } else {
+        monthlyCost = Number(mu) || 0;
+      }
+    }
+    if (monthlyCost === 0 && Array.isArray(bizData.total_costs) && bizData.total_costs[0]) {
+      monthlyCost = readAmount(bizData.total_costs[0].amount);
+      if (monthlyCost > 0 && bizData.total_costs[0].currency) currency = bizData.total_costs[0].currency;
+    }
+    if (monthlyCost === 0 && Array.isArray(bizData.monthly_costs) && bizData.monthly_costs[0]) {
+      monthlyCost = readAmount(bizData.monthly_costs[0].amount);
+      if (monthlyCost > 0 && bizData.monthly_costs[0].currency) currency = bizData.monthly_costs[0].currency;
+    }
+    if (monthlyCost === 0 && bizData.monthly_cost !== undefined) {
+      monthlyCost = readAmount(bizData.monthly_cost);
+    }
 
     return {
       balance: {
-        total: normalBal,
+        total,
         normal_wallet_balance: normalBal,
         bonus_wallet_balance: bonusBal,
         currency,
@@ -137,65 +318,58 @@
   }
 
   function transformUsageAmount(bizData) {
-    const today = utcToday();
     const models = {};
+    const seen = {};
 
-    let todayEntries = [];
-    if (bizData.days) {
-      const todayDay = bizData.days.find(d => d.date === today);
-      if (todayDay && todayDay.data) {
-        todayEntries = todayDay.data;
+    for (const rec of collectUsageRecords(bizData)) {
+      if (!isTodayRecord(rec)) continue;
+      const metrics = extractMetricsFromUsageFlexible(rec.usage);
+      if (!seen[rec.model]) {
+        seen[rec.model] = true;
+        models[rec.model] = metrics;
+      } else {
+        const m = models[rec.model];
+        m.requests += metrics.requests;
+        m.tokens.total += metrics.tokens.total;
+        m.tokens.cached_input += metrics.tokens.cached_input;
+        m.tokens.uncached_input += metrics.tokens.uncached_input;
+        m.tokens.output += metrics.tokens.output;
+        const divisor = m.tokens.cached_input + m.tokens.uncached_input;
+        m.cache_hit_rate = divisor > 0
+          ? Math.round((m.tokens.cached_input / divisor) * 10000) / 100
+          : null;
       }
     }
 
-    const allEntries = [...todayEntries, ...(bizData.total || [])];
-
-    for (const entry of allEntries) {
-      if (!entry.model) continue;
-      const modelLower = entry.model.toLowerCase();
-      const isPro = modelLower.includes('pro') && (modelLower.includes('v4') || modelLower.includes('v-4'));
-      const isFlash = modelLower.includes('flash') && (modelLower.includes('v4') || modelLower.includes('v-4'));
-      if (!isPro && !isFlash) continue;
-
-      const metrics = extractMetricsFromUsage(usageArrayToMap(entry.usage));
-      if (todayEntries.includes(entry) || !models[entry.model]) {
-        models[entry.model] = metrics;
-      }
-    }
-
-    return { today_date: today, models };
+    return { today_date: localToday(), models };
   }
 
   function transformUsageCost(bizData) {
-    const today = utcToday();
     let todayCost = 0;
+    let monthlyCost = 0;
     const modelCosts = {};
-    const currency = bizData.currency || 'CNY';
-
-    if (bizData.days) {
-      const todayDay = bizData.days.find(d => d.date === today);
-      if (todayDay && todayDay.data) {
-        for (const entry of todayDay.data) {
-          if (entry.usage) {
-            let entryCost = 0;
-            for (const u of entry.usage) {
-              entryCost += Number(u.amount) || 0;
-            }
-            todayCost += entryCost;
-            if (entry.model) {
-              const ml = entry.model.toLowerCase();
-              const isPro = ml.includes('pro') && (ml.includes('v4') || ml.includes('v-4'));
-              const isFlash = ml.includes('flash') && (ml.includes('v4') || ml.includes('v-4'));
-              if (isPro || isFlash) {
-                modelCosts[entry.model] = (modelCosts[entry.model] || 0) + entryCost;
-              }
-            }
-          }
-        }
-      }
+    let currency = bizData.currency || 'CNY';
+    if (Array.isArray(bizData.data) && bizData.data[0] && bizData.data[0].currency) {
+      currency = bizData.data[0].currency;
     }
 
-    return { today_cost: { amount: Math.floor(todayCost * 100) / 100, currency }, model_costs: modelCosts };
+    const currentMonth = localToday().slice(0, 7);
+    for (const rec of collectCostRecords(bizData)) {
+      // 本月消费: 新版桶结构按 time 累加当月金额 (标签准确, 不依赖 summary 结构)
+      if (rec.time !== undefined && localDateOf(rec.time).slice(0, 7) === currentMonth) {
+        monthlyCost += rec.cost;
+      }
+
+      if (!isTodayRecord(rec)) continue;
+      todayCost += rec.cost;
+      if (rec.model) modelCosts[rec.model] = (modelCosts[rec.model] || 0) + rec.cost;
+    }
+
+    return {
+      today_cost: { amount: Math.floor(todayCost * 100) / 100, currency },
+      monthly_cost: { amount: Math.floor(monthlyCost * 100) / 100, currency },
+      model_costs: modelCosts,
+    };
   }
 
   function buildOutputPayload() {
@@ -222,9 +396,16 @@
       }
     }
 
+    // 本月消费: 优先用 cost 接口当月桶累加 (标签准确); 取不到时回退 summary 解析
+    let monthlyConsumption = summary.monthly_consumption;
+    if (costData.monthly_cost && costData.monthly_cost.amount > 0) {
+      monthlyConsumption = costData.monthly_cost;
+    }
+
     return {
       timestamp: new Date().toISOString(),
       ...summary,
+      monthly_consumption: monthlyConsumption,
       ...usageData,
       ...costData,
     };
@@ -235,16 +416,25 @@
   // ============================================================
 
   const TRACKED_ENDPOINTS = [
-    { method: 'GET', path: '/api/v0/users/get_user_summary', id: 'get_user_summary' },
-    { method: 'GET', path: '/api/v0/usage/amount', id: 'usage_amount' },
-    { method: 'GET', path: '/api/v0/usage/cost', id: 'usage_cost' },
+    { method: 'GET', path: '/users/get_user_summary', id: 'get_user_summary' },
+    // 新版平台 (2026-07 改版): 按 API Key 拆分用量
+    { method: 'GET', path: '/usage/by_api_key/amount', id: 'usage_amount' },
+    { method: 'GET', path: '/usage/by_api_key/cost', id: 'usage_cost' },
+    // 旧版平台兼容
+    { method: 'GET', path: '/usage/amount', id: 'usage_amount' },
+    { method: 'GET', path: '/usage/cost', id: 'usage_cost' },
   ];
 
   function matchEndpoint(method, url) {
+    const m = method.toUpperCase();
     for (const ep of TRACKED_ENDPOINTS) {
-      if (method.toUpperCase() === ep.method && url.includes(ep.path)) {
+      if (m === ep.method && url.includes(ep.path)) {
         return ep;
       }
+    }
+    // 新版平台也可能通过 /api/v0/users/{id} 返回账户汇总
+    if (m === 'GET' && /\/users\/\d+(\/|$|\?)/.test(url)) {
+      return { method: 'GET', path: '', id: 'get_user_summary' };
     }
     return null;
   }
