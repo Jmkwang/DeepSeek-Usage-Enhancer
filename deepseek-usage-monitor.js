@@ -1,18 +1,25 @@
 // ==UserScript==
 // @name         DeepSeek Daily Monitor
-// @namespace    https://github.com/local/deepseek-usage-monitor
-// @version      1.4.3
+// @namespace    https://github.com/vlify/DeepSeek-Usage-Enhancer
+// @version      1.4.4
 // @description  拦截 DeepSeek 开放平台用量 API（兼容新版 by_api_key 接口），在小窗口中展示完整数据（纯本地，无远程通信）
-// @author       Jmkwang
+// @author       Jmkwang; vlify
 // @license      MIT
+// @homepageURL  https://github.com/vlify/DeepSeek-Usage-Enhancer
+// @supportURL   https://github.com/vlify/DeepSeek-Usage-Enhancer/issues
 // @match        https://platform.deepseek.com/usage*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
 // ============================================================
-// 适配新版平台 (2026-07 改版): 拦截 /usage/by_api_key/amount|cost
-// 新接口 (series[].buckets[], 金额为字符串), 同时兼容旧版结构
+// 本脚本为 Jmkwang/DeepSeek-Usage-Enhancer 的修改版 (fork)
+// 原项目: https://github.com/Jmkwang/DeepSeek-Usage-Enhancer (MIT)
+// 修改者: vlify
+// 修改内容: ① 元数据规范化, 为 GreasyFork 托管做准备
+//           ② 适配新版平台 (2026-07 改版): 拦截 /usage/by_api_key/amount|cost
+//              新接口 (series[].buckets[], 金额为字符串), 同时兼容旧版结构
+// 许可证: MIT, 完整文本见仓库 LICENSE 文件
 // ============================================================
 
 (function () {
@@ -265,25 +272,35 @@
       else if (tu + gr > 0) total = tu + gr;
     }
 
+    // 币种: 钱包币种优先 (真实货币), 其次 bizData.currency, 默认 CNY
+    let currency = 'CNY';
+    if (Array.isArray(bizData.normal_wallets) && bizData.normal_wallets[0] && bizData.normal_wallets[0].currency) {
+      currency = bizData.normal_wallets[0].currency;
+    } else if (Array.isArray(bizData.bonus_wallets) && bizData.bonus_wallets[0] && bizData.bonus_wallets[0].currency) {
+      currency = bizData.bonus_wallets[0].currency;
+    } else if (bizData.currency) {
+      currency = bizData.currency;
+    }
+
     // 本月消费: 新版 monthly_usage (数字或 {amount,currency}) / total_costs[] / 旧版 monthly_costs[]
+    // 注意: monthly_usage 可能是 Token 用量对象 (带 currency 但无金额), 只在取到金额时才采用其币种
     let monthlyCost = 0;
-    let currency = bizData.currency || 'CNY';
     const mu = bizData.monthly_usage;
     if (mu !== undefined && mu !== null) {
       if (typeof mu === 'object') {
         monthlyCost = readAmount(mu.amount);
-        if (mu.currency) currency = mu.currency;
+        if (monthlyCost > 0 && mu.currency) currency = mu.currency;
       } else {
         monthlyCost = Number(mu) || 0;
       }
     }
     if (monthlyCost === 0 && Array.isArray(bizData.total_costs) && bizData.total_costs[0]) {
       monthlyCost = readAmount(bizData.total_costs[0].amount);
-      if (bizData.total_costs[0].currency) currency = bizData.total_costs[0].currency;
+      if (monthlyCost > 0 && bizData.total_costs[0].currency) currency = bizData.total_costs[0].currency;
     }
     if (monthlyCost === 0 && Array.isArray(bizData.monthly_costs) && bizData.monthly_costs[0]) {
       monthlyCost = readAmount(bizData.monthly_costs[0].amount);
-      if (bizData.monthly_costs[0].currency) currency = bizData.monthly_costs[0].currency;
+      if (monthlyCost > 0 && bizData.monthly_costs[0].currency) currency = bizData.monthly_costs[0].currency;
     }
     if (monthlyCost === 0 && bizData.monthly_cost !== undefined) {
       monthlyCost = readAmount(bizData.monthly_cost);
@@ -329,19 +346,30 @@
 
   function transformUsageCost(bizData) {
     let todayCost = 0;
+    let monthlyCost = 0;
     const modelCosts = {};
     let currency = bizData.currency || 'CNY';
     if (Array.isArray(bizData.data) && bizData.data[0] && bizData.data[0].currency) {
       currency = bizData.data[0].currency;
     }
 
+    const currentMonth = localToday().slice(0, 7);
     for (const rec of collectCostRecords(bizData)) {
+      // 本月消费: 新版桶结构按 time 累加当月金额 (标签准确, 不依赖 summary 结构)
+      if (rec.time !== undefined && localDateOf(rec.time).slice(0, 7) === currentMonth) {
+        monthlyCost += rec.cost;
+      }
+
       if (!isTodayRecord(rec)) continue;
       todayCost += rec.cost;
       if (rec.model) modelCosts[rec.model] = (modelCosts[rec.model] || 0) + rec.cost;
     }
 
-    return { today_cost: { amount: Math.floor(todayCost * 100) / 100, currency }, model_costs: modelCosts };
+    return {
+      today_cost: { amount: Math.floor(todayCost * 100) / 100, currency },
+      monthly_cost: { amount: Math.floor(monthlyCost * 100) / 100, currency },
+      model_costs: modelCosts,
+    };
   }
 
   function buildOutputPayload() {
@@ -368,9 +396,16 @@
       }
     }
 
+    // 本月消费: 优先用 cost 接口当月桶累加 (标签准确); 取不到时回退 summary 解析
+    let monthlyConsumption = summary.monthly_consumption;
+    if (costData.monthly_cost && costData.monthly_cost.amount > 0) {
+      monthlyConsumption = costData.monthly_cost;
+    }
+
     return {
       timestamp: new Date().toISOString(),
       ...summary,
+      monthly_consumption: monthlyConsumption,
       ...usageData,
       ...costData,
     };
