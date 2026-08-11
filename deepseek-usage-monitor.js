@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek Daily Monitor
 // @namespace    https://github.com/local/deepseek-usage-monitor
-// @version      1.4.0
+// @version      1.4.1
 // @description  拦截 DeepSeek 开放平台用量 API（兼容新版 by_api_key 接口），在小窗口中展示完整数据（纯本地，无远程通信）
 // @author       Jmkwang
 // @license      MIT
@@ -139,10 +139,17 @@
     }
     if (usage && typeof usage === 'object') {
       const n = (v) => Number(v) || 0;
-      const cachedInput = n(usage.prompt_cache_hit_token !== undefined ? usage.prompt_cache_hit_token : usage.cached_input_tokens);
-      const uncachedInput = n(usage.prompt_cache_miss_token !== undefined ? usage.prompt_cache_miss_token : usage.uncached_input_tokens);
-      const output = n(usage.response_token !== undefined ? usage.response_token : usage.output_tokens);
-      const requests = n(usage.request !== undefined ? usage.request : usage.api_requests);
+      const pick = (...keys) => {
+        for (const k of keys) {
+          if (usage[k] !== undefined) return n(usage[k]);
+        }
+        return 0;
+      };
+      // 新版接口字段为 camelCase: usage.request / responseToken / promptCacheHitToken / promptCacheMissToken
+      const cachedInput = pick('promptCacheHitToken', 'prompt_cache_hit_token', 'cached_input_tokens', 'cache_hit_tokens');
+      const uncachedInput = pick('promptCacheMissToken', 'prompt_cache_miss_token', 'uncached_input_tokens', 'cache_miss_tokens');
+      const output = pick('responseToken', 'response_token', 'output_tokens', 'completion_tokens');
+      const requests = pick('request', 'apiRequests', 'api_requests', 'requests');
       const total = cachedInput + uncachedInput + output;
       const divisor = cachedInput + uncachedInput;
       const cacheHitRate = divisor > 0
